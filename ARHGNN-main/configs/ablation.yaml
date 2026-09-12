@@ -1,0 +1,27 @@
+seed: 42
+
+paths:
+  primary_data: data/private/IgAdata1.xlsx
+  external_data: data/private/IgAdata2.xlsx
+  output_dir: results_fixed/ablation
+
+split:
+  test_size: 0.2
+  val_size: 0.2
+
+imbalance:
+  use_smote: true
+
+model:
+  hidden_channels: 32
+  dropout: 0.5
+
+training:
+  epochs: 60
+  learning_rate: 0.0005
+  weight_decay: 0.0005
+  patience: 30
+
+evaluation:
+  threshold: 0.5
+  bootstrap: 300
