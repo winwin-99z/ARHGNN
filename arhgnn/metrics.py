@@ -12,6 +12,22 @@ def sigmoid(logits: np.ndarray) -> np.ndarray:
     return 1.0 / (1.0 + np.exp(-logits))
 
 
+def _labelset_stratified_bootstrap_indices(y_true: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Resample patients within observed multi-label strata.
+
+    Each evaluation call contains one cohort or split.  Keeping the number of
+    patients in every observed label-set stratum fixed preserves the cohort's
+    multi-label case mix while resampling patients with replacement within it.
+    """
+    label_sets = np.asarray(y_true, dtype=np.int8)
+    _, inverse = np.unique(label_sets, axis=0, return_inverse=True)
+    sampled = []
+    for stratum in range(int(inverse.max()) + 1):
+        members = np.flatnonzero(inverse == stratum)
+        sampled.append(rng.choice(members, size=len(members), replace=True))
+    return np.concatenate(sampled)
+
+
 def evaluate_multilabel(
     y_true: np.ndarray,
     y_prob: np.ndarray,
@@ -38,7 +54,7 @@ def evaluate_multilabel(
         rng = np.random.default_rng(seed)
         boot_values: dict[str, list[float]] = {key: [] for key in summary}
         for _ in range(bootstrap):
-            idx = rng.integers(0, len(y_true), size=len(y_true))
+            idx = _labelset_stratified_bootstrap_indices(y_true, rng)
             boot_summary, _ = _compute_metrics(
                 y_true[idx], y_prob[idx], threshold, label_names,
                 common_calibration_bins, sparse_calibration_bins, sparse_positive_cutoff,
@@ -63,6 +79,10 @@ def evaluate_multilabel(
     return {
         "threshold": float(threshold),
         "n_samples": int(y_true.shape[0]),
+        "bootstrap": {
+            "iterations": int(bootstrap),
+            "method": "patient_level_labelset_stratified_within_evaluation_cohort",
+        },
         "calibration": {
             "binning": "equal_frequency",
             "common_label_bins": int(common_calibration_bins),

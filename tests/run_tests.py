@@ -12,7 +12,13 @@ sys.path.insert(0, str(ROOT))
 
 from arhgnn.data import EDGE_TYPE_NAMES, FeaturePreprocessor, PatientHypergraphBuilder, load_dataset
 from arhgnn.config import load_config
-from arhgnn.metrics import evaluate_multilabel, metric_invariants, read_prediction_csv, write_predictions
+from arhgnn.metrics import (
+    _labelset_stratified_bootstrap_indices,
+    evaluate_multilabel,
+    metric_invariants,
+    read_prediction_csv,
+    write_predictions,
+)
 from arhgnn.model import ARHGNN
 from arhgnn.splits import split_train_val_test
 
@@ -73,6 +79,13 @@ class DataLeakageTests(unittest.TestCase):
 
 
 class MetricsTests(unittest.TestCase):
+    def test_labelset_stratified_bootstrap_preserves_stratum_sizes(self):
+        y_true = np.array([[1, 0], [1, 0], [1, 0], [0, 1], [0, 1], [0, 0]], dtype=np.float32)
+        idx = _labelset_stratified_bootstrap_indices(y_true, np.random.default_rng(42))
+        _, original_counts = np.unique(y_true, axis=0, return_counts=True)
+        _, sampled_counts = np.unique(y_true[idx], axis=0, return_counts=True)
+        np.testing.assert_array_equal(sampled_counts, original_counts)
+
     def test_probability_threshold_metrics(self):
         y_true = np.array([[1, 0], [0, 1], [1, 1], [0, 0]], dtype=np.float32)
         y_prob = np.array([[0.60, 0.40], [0.40, 0.70], [0.51, 0.49], [0.20, 0.80]], dtype=np.float32)
