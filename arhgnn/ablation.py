@@ -82,8 +82,8 @@ def run(config_path: str | Path, epochs_override: int | None = None, bootstrap_o
                 loss_name="bce",
             )
             model.load_state_dict(result["best_state"])
-            primary_prob = predict_prob(model, prepared.x_test, prepared.p_test, device)
-            external_prob = predict_prob(model, prepared.x_external, prepared.p_external, device)
+            primary_prob = predict_prob(model, prepared.x_test_graph, prepared.p_test, device)[prepared.test_query_start :]
+            external_prob = predict_prob(model, prepared.x_external_graph, prepared.p_external, device)[prepared.external_query_start :]
             primary_metrics = evaluate_multilabel(prepared.y_test, primary_prob, threshold, bootstrap, seed, prepared.primary.label_names)
             external_metrics = evaluate_multilabel(prepared.y_external, external_prob, threshold, bootstrap, seed, prepared.primary.label_names)
             writer.writerow(
@@ -103,4 +103,3 @@ def run(config_path: str | Path, epochs_override: int | None = None, bootstrap_o
 
 if __name__ == "__main__":
     main()
-

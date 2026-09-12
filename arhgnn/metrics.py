@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import json
 from pathlib import Path
 
 import numpy as np
@@ -18,6 +19,9 @@ def evaluate_multilabel(
     bootstrap: int = 1000,
     seed: int = 42,
     label_names: list[str] | None = None,
+    common_calibration_bins: int = 10,
+    sparse_calibration_bins: int = 5,
+    sparse_positive_cutoff: int = 20,
 ) -> dict[str, object]:
     y_true = np.asarray(y_true, dtype=np.float32)
     y_prob = np.asarray(y_prob, dtype=np.float32)
@@ -26,13 +30,19 @@ def evaluate_multilabel(
     if label_names is None:
         label_names = [f"label_{i}" for i in range(y_true.shape[1])]
 
-    summary, per_label = _compute_metrics(y_true, y_prob, threshold, label_names)
+    summary, per_label = _compute_metrics(
+        y_true, y_prob, threshold, label_names,
+        common_calibration_bins, sparse_calibration_bins, sparse_positive_cutoff,
+    )
     if bootstrap > 0 and len(y_true) > 1:
         rng = np.random.default_rng(seed)
         boot_values: dict[str, list[float]] = {key: [] for key in summary}
         for _ in range(bootstrap):
             idx = rng.integers(0, len(y_true), size=len(y_true))
-            boot_summary, _ = _compute_metrics(y_true[idx], y_prob[idx], threshold, label_names)
+            boot_summary, _ = _compute_metrics(
+                y_true[idx], y_prob[idx], threshold, label_names,
+                common_calibration_bins, sparse_calibration_bins, sparse_positive_cutoff,
+            )
             for key, value in boot_summary.items():
                 boot_values[key].append(value)
         summary_with_ci = {}
@@ -53,6 +63,12 @@ def evaluate_multilabel(
     return {
         "threshold": float(threshold),
         "n_samples": int(y_true.shape[0]),
+        "calibration": {
+            "binning": "equal_frequency",
+            "common_label_bins": int(common_calibration_bins),
+            "sparse_label_bins": int(sparse_calibration_bins),
+            "sparse_positive_cutoff": int(sparse_positive_cutoff),
+        },
         "summary": summary_with_ci,
         "per_label": per_label,
     }
@@ -64,19 +80,26 @@ def write_predictions(
     y_prob: np.ndarray,
     label_names: list[str],
     threshold: float = 0.5,
+    cohort_id: str | None = None,
+    split_id: str | None = None,
 ) -> None:
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
     y_pred = (np.asarray(y_prob) >= threshold).astype(int)
     with path.open("w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        header = []
+        header = ["Record_ID", "Cohort_ID", "Split_ID"]
         header.extend([f"True_Label_{name}" for name in label_names])
         header.extend([f"Prob_Class_{name}" for name in label_names])
         header.extend([f"Pred_Label_{name}" for name in label_names])
         writer.writerow(header)
-        for true_row, prob_row, pred_row in zip(y_true.astype(int), y_prob, y_pred):
-            writer.writerow(true_row.tolist() + [float(v) for v in prob_row] + pred_row.tolist())
+        for index, (true_row, prob_row, pred_row) in enumerate(zip(y_true.astype(int), y_prob, y_pred), start=1):
+            writer.writerow(
+                [f"record_{index:06d}", cohort_id or "unspecified", split_id or "unspecified"]
+                + true_row.tolist()
+                + [float(v) for v in prob_row]
+                + pred_row.tolist()
+            )
 
 
 def read_prediction_csv(path: str | Path) -> tuple[np.ndarray, np.ndarray, list[str]]:
@@ -119,20 +142,65 @@ def write_per_label_metrics(path: str | Path, metrics: dict[str, object]) -> Non
         writer.writerows(rows)
 
 
+def metric_invariants(metrics: dict[str, object]) -> dict[str, float | bool]:
+    """Return machine-readable checks linking aggregate metrics to per-label counts."""
+
+    summary = metrics["summary"]
+    per_label = metrics["per_label"]
+    accuracy = float(summary["elementwise_accuracy"]["mean"])
+    hamming = float(summary["hamming_loss"]["mean"])
+    supports = np.asarray([row["positives"] for row in per_label], dtype=float)
+    f1 = np.asarray([row["f1"] for row in per_label], dtype=float)
+    weighted_f1 = float(summary["weighted_f1"]["mean"])
+    recomputed_weighted_f1 = float(np.sum(supports * f1) / supports.sum()) if supports.sum() else 0.0
+    correct = int(sum(int(row["tp"]) + int(row["tn"]) for row in per_label))
+    total = int(sum(int(row["n"]) for row in per_label))
+    return {
+        "accuracy_plus_hamming_equals_one": bool(np.isclose(accuracy + hamming, 1.0, atol=1e-12)),
+        "weighted_f1_reproducible_from_per_label_values": bool(
+            np.isclose(weighted_f1, recomputed_weighted_f1, atol=1e-12)
+        ),
+        "figure8_tally_matches_elementwise_accuracy": bool(
+            total > 0 and np.isclose(correct / total, accuracy, atol=1e-12)
+        ),
+        "correct_patient_label_decisions": correct,
+        "total_patient_label_decisions": total,
+        "weighted_f1_from_per_label_values": recomputed_weighted_f1,
+    }
+
+
+def write_metric_audit(path: str | Path, metrics: dict[str, object]) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "threshold": metrics["threshold"],
+        "n_samples": metrics["n_samples"],
+        "calibration": metrics["calibration"],
+        "invariants": metric_invariants(metrics),
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
 def _compute_metrics(
     y_true: np.ndarray,
     y_prob: np.ndarray,
     threshold: float,
     label_names: list[str],
+    common_calibration_bins: int,
+    sparse_calibration_bins: int,
+    sparse_positive_cutoff: int,
 ) -> tuple[dict[str, float], list[dict[str, float | int | str]]]:
     y_pred = (y_prob >= threshold).astype(np.float32)
     tp = ((y_true == 1) & (y_pred == 1)).sum(axis=0).astype(float)
     fp = ((y_true == 0) & (y_pred == 1)).sum(axis=0).astype(float)
     fn = ((y_true == 1) & (y_pred == 0)).sum(axis=0).astype(float)
+    tn = ((y_true == 0) & (y_pred == 0)).sum(axis=0).astype(float)
     support = y_true.sum(axis=0).astype(float)
+    negatives = y_true.shape[0] - support
 
     precision = _safe_div(tp, tp + fp)
     recall = _safe_div(tp, tp + fn)
+    specificity = _safe_div(tn, tn + fp)
     f1 = _safe_div(2 * precision * recall, precision + recall)
     weights = support / support.sum() if support.sum() > 0 else np.zeros_like(support)
 
@@ -146,26 +214,46 @@ def _compute_metrics(
 
     per_label = []
     for i, name in enumerate(label_names):
-        ci_low, ci_high = _wilson_ci(int(tp[i]), int(support[i]))
+        precision_ci_low, precision_ci_high = _wilson_ci(int(tp[i]), int(tp[i] + fp[i]))
+        recall_ci_low, recall_ci_high = _wilson_ci(int(tp[i]), int(support[i]))
+        specificity_ci_low, specificity_ci_high = _wilson_ci(int(tn[i]), int(tn[i] + fp[i]))
+        bin_count = sparse_calibration_bins if support[i] < sparse_positive_cutoff else common_calibration_bins
+        brier, ece, occupied_bins = _calibration_metrics(y_true[:, i], y_prob[:, i], bin_count)
         per_label.append(
             {
                 "label": name,
+                "n": int(y_true.shape[0]),
                 "support": int(support[i]),
+                "positives": int(support[i]),
+                "negatives": int(negatives[i]),
                 "tp": int(tp[i]),
                 "fp": int(fp[i]),
                 "fn": int(fn[i]),
+                "tn": int(tn[i]),
                 "precision": float(precision[i]),
+                "precision_ci_low": precision_ci_low,
+                "precision_ci_high": precision_ci_high,
                 "recall": float(recall[i]),
-                "recall_ci_low": ci_low,
-                "recall_ci_high": ci_high,
+                "recall_ci_low": recall_ci_low,
+                "recall_ci_high": recall_ci_high,
+                "specificity": float(specificity[i]),
+                "specificity_ci_low": specificity_ci_low,
+                "specificity_ci_high": specificity_ci_high,
                 "f1": float(f1[i]),
                 "auc": float(aucs[i]),
+                "auprc": float(aps[i]),
                 "average_precision": float(aps[i]),
+                "brier_score": brier,
+                "expected_calibration_error": ece,
+                "calibration_bin_count": int(bin_count),
+                "occupied_bins": int(occupied_bins),
             }
         )
 
+    hamming_loss = float(np.mean(y_true != y_pred))
     summary = {
-        "hamming_loss": float(np.mean(y_true != y_pred)),
+        "elementwise_accuracy": float(np.mean(y_true == y_pred)),
+        "hamming_loss": hamming_loss,
         "subset_accuracy": float(np.mean(np.all(y_true == y_pred, axis=1))),
         "macro_precision": float(np.nanmean(precision)),
         "macro_recall": float(np.nanmean(recall)),
@@ -178,6 +266,22 @@ def _compute_metrics(
         "macro_ap": float(np.nanmean(aps)),
     }
     return summary, per_label
+
+
+def _calibration_metrics(y_true: np.ndarray, y_prob: np.ndarray, bin_count: int) -> tuple[float, float, int]:
+    """Brier score and ECE using non-empty equal-frequency probability bins."""
+
+    y_true = np.asarray(y_true, dtype=float)
+    y_prob = np.asarray(y_prob, dtype=float)
+    if len(y_true) == 0:
+        return float("nan"), float("nan"), 0
+    bins = [group for group in np.array_split(np.argsort(y_prob, kind="stable"), max(1, int(bin_count))) if len(group)]
+    ece = 0.0
+    for indices in bins:
+        observed = float(y_true[indices].mean())
+        predicted = float(y_prob[indices].mean())
+        ece += len(indices) / len(y_true) * abs(observed - predicted)
+    return float(np.mean((y_prob - y_true) ** 2)), float(ece), len(bins)
 
 
 def _safe_div(num: np.ndarray, den: np.ndarray) -> np.ndarray:
@@ -204,7 +308,7 @@ def _binary_auc(y_true: np.ndarray, y_score: np.ndarray) -> float:
     fps = np.cumsum(y_sorted == 0)
     tpr = np.concatenate([[0.0], tps / positives.sum(), [1.0]])
     fpr = np.concatenate([[0.0], fps / negatives.sum(), [1.0]])
-    return float(np.trapezoid(tpr, fpr))
+    return float(np.trapz(tpr, fpr))
 
 
 def _average_precision(y_true: np.ndarray, y_score: np.ndarray) -> float:

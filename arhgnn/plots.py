@@ -12,6 +12,9 @@ def write_standard_plots(
     y_external: np.ndarray,
     p_external: np.ndarray,
     label_names: list[str],
+    common_calibration_bins: int = 10,
+    sparse_calibration_bins: int = 5,
+    sparse_positive_cutoff: int = 20,
 ) -> None:
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -19,7 +22,14 @@ def write_standard_plots(
 
     _plot_roc(output_dir / "roc_primary_test.png", y_test, p_test, label_names, "Primary Test ROC")
     _plot_roc(output_dir / "roc_external.png", y_external, p_external, label_names, "External Validation ROC")
-    _plot_calibration(output_dir / "calibration_external.png", y_external, p_external, label_names)
+    _plot_calibration(
+        output_dir / "calibration_primary_test.png", y_test, p_test, label_names,
+        "Primary Test Calibration", common_calibration_bins, sparse_calibration_bins, sparse_positive_cutoff,
+    )
+    _plot_calibration(
+        output_dir / "calibration_external.png", y_external, p_external, label_names,
+        "External Validation Calibration", common_calibration_bins, sparse_calibration_bins, sparse_positive_cutoff,
+    )
     _plot_dca(output_dir / "dca_external.png", y_external, p_external, label_names)
 
 
@@ -42,29 +52,39 @@ def _plot_roc(path: Path, y_true: np.ndarray, y_prob: np.ndarray, label_names: l
     plt.close(fig)
 
 
-def _plot_calibration(path: Path, y_true: np.ndarray, y_prob: np.ndarray, label_names: list[str], bins: int = 8) -> None:
+def _plot_calibration(
+    path: Path,
+    y_true: np.ndarray,
+    y_prob: np.ndarray,
+    label_names: list[str],
+    title: str,
+    common_bins: int = 10,
+    sparse_bins: int = 5,
+    sparse_positive_cutoff: int = 20,
+) -> None:
     import matplotlib.pyplot as plt
 
     fig, ax = plt.subplots(figsize=(7, 6))
-    grid = np.linspace(0, 1, bins + 1)
     for i, label in enumerate(label_names):
-        observed = []
-        predicted = []
-        for left, right in zip(grid[:-1], grid[1:]):
-            mask = (y_prob[:, i] >= left) & (y_prob[:, i] < right if right < 1 else y_prob[:, i] <= right)
-            if mask.sum() == 0:
-                continue
-            observed.append(float(y_true[mask, i].mean()))
-            predicted.append(float(y_prob[mask, i].mean()))
-        ax.plot(predicted, observed, marker="o", lw=1.5, label=label)
+        bins = sparse_bins if int(y_true[:, i].sum()) < sparse_positive_cutoff else common_bins
+        predicted, observed = _equal_frequency_calibration(y_true[:, i], y_prob[:, i], bins)
+        ax.plot(predicted, observed, marker="o", lw=1.5, label=f"{label} ({len(predicted)} bins)")
     ax.plot([0, 1], [0, 1], color="0.4", linestyle="--", lw=1)
     ax.set_xlabel("Mean Predicted Probability")
     ax.set_ylabel("Observed Frequency")
-    ax.set_title("External Validation Calibration")
+    ax.set_title(title)
     ax.legend(fontsize=8)
     fig.tight_layout()
     fig.savefig(path, dpi=220)
     plt.close(fig)
+
+
+def _equal_frequency_calibration(y_true: np.ndarray, y_prob: np.ndarray, bins: int) -> tuple[list[float], list[float]]:
+    order = np.argsort(y_prob, kind="stable")
+    groups = [group for group in np.array_split(order, max(1, int(bins))) if len(group)]
+    predicted = [float(y_prob[group].mean()) for group in groups]
+    observed = [float(y_true[group].mean()) for group in groups]
+    return predicted, observed
 
 
 def _plot_dca(path: Path, y_true: np.ndarray, y_prob: np.ndarray, label_names: list[str]) -> None:
@@ -109,4 +129,3 @@ def _net_benefit(y_true: np.ndarray, y_pred: np.ndarray, threshold: float) -> fl
     fp = np.logical_and(~y_true, y_pred).sum()
     n = len(y_true)
     return float((tp / n) - (fp / n) * (threshold / (1 - threshold)))
-

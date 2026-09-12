@@ -1,8 +1,9 @@
 seed: 42
 
 paths:
-  primary_data: data/IgAdata1.xlsx
-  external_data: data/IgAdata2.xlsx
+  # Private files: keep outside version control and obtain through controlled access.
+  primary_data: data/private/IgAdata1.xlsx
+  external_data: data/private/IgAdata2.xlsx
   output_dir: results_fixed
 
 split:
@@ -19,13 +20,13 @@ imbalance:
   method: labelset_smote
 
 model:
-  hidden_channels: 64
+  hidden_channels: 32
   dropout: 0.5
   use_attention: true
   use_residual: true
 
 training:
-  epochs: 100
+  epochs: 300
   learning_rate: 0.0005
   weight_decay: 0.0005
   patience: 50
@@ -34,4 +35,11 @@ training:
 evaluation:
   threshold: 0.5
   bootstrap: 1000
+  calibration:
+    common_label_bins: 10
+    sparse_label_bins: 5
+    sparse_positive_cutoff: 20
 
+reproducibility:
+  patient_level_outputs: restricted
+  write_results_manifest: true

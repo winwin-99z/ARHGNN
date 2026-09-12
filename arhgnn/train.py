@@ -11,9 +11,10 @@ import torch.nn as nn
 
 from .config import load_config, project_root_from_config, resolve_path
 from .data import EDGE_TYPE_NAMES
-from .metrics import evaluate_multilabel, write_metrics, write_per_label_metrics, write_predictions
+from .metrics import evaluate_multilabel, write_metric_audit, write_metrics, write_per_label_metrics, write_predictions
 from .model import ARHGNN, FocalLoss
 from .pipeline import PreparedData, prepare_data
+from .reproducibility import write_results_manifest
 
 
 def main() -> None:
@@ -64,6 +65,12 @@ def run(
     epochs = int(epochs_override if epochs_override is not None else training_cfg.get("epochs", 100))
     bootstrap = int(bootstrap_override if bootstrap_override is not None else config.get("evaluation", {}).get("bootstrap", 1000))
     threshold = float(config.get("evaluation", {}).get("threshold", 0.5))
+    calibration_cfg = config.get("evaluation", {}).get("calibration", {})
+    calibration_kwargs = {
+        "common_calibration_bins": int(calibration_cfg.get("common_label_bins", 10)),
+        "sparse_calibration_bins": int(calibration_cfg.get("sparse_label_bins", 5)),
+        "sparse_positive_cutoff": int(calibration_cfg.get("sparse_positive_cutoff", 20)),
+    }
     device = torch.device(device_override or ("cuda" if torch.cuda.is_available() else "cpu"))
 
     model = ARHGNN(
@@ -100,18 +107,30 @@ def run(
     )
     model.load_state_dict(train_result["best_state"])
 
-    test_prob = predict_prob(model, prepared.x_test, prepared.p_test, device)
-    external_prob = predict_prob(model, prepared.x_external, prepared.p_external, device)
+    test_prob = predict_prob(model, prepared.x_test_graph, prepared.p_test, device)[prepared.test_query_start :]
+    external_prob = predict_prob(model, prepared.x_external_graph, prepared.p_external, device)[prepared.external_query_start :]
 
-    write_predictions(output_dir / "predictions_primary_test.csv", prepared.y_test, test_prob, prepared.primary.label_names, threshold)
-    write_predictions(output_dir / "predictions_external.csv", prepared.y_external, external_prob, prepared.primary.label_names, threshold)
+    write_predictions(
+        output_dir / "predictions_primary_test.csv", prepared.y_test, test_prob, prepared.primary.label_names,
+        threshold, cohort_id="IgA_ZCMU_1", split_id="held_out_test",
+    )
+    write_predictions(
+        output_dir / "predictions_external.csv", prepared.y_external, external_prob, prepared.primary.label_names,
+        threshold, cohort_id="IgA_ZCMU_2", split_id="external_validation",
+    )
 
-    test_metrics = evaluate_multilabel(prepared.y_test, test_prob, threshold, bootstrap, seed, prepared.primary.label_names)
-    external_metrics = evaluate_multilabel(prepared.y_external, external_prob, threshold, bootstrap, seed, prepared.primary.label_names)
+    test_metrics = evaluate_multilabel(
+        prepared.y_test, test_prob, threshold, bootstrap, seed, prepared.primary.label_names, **calibration_kwargs
+    )
+    external_metrics = evaluate_multilabel(
+        prepared.y_external, external_prob, threshold, bootstrap, seed, prepared.primary.label_names, **calibration_kwargs
+    )
     write_metrics(output_dir / "metrics_primary_test.csv", test_metrics)
     write_metrics(output_dir / "metrics_external.csv", external_metrics)
     write_per_label_metrics(output_dir / "per_label_metrics_primary_test.csv", test_metrics)
     write_per_label_metrics(output_dir / "per_label_metrics_external.csv", external_metrics)
+    write_metric_audit(output_dir / "metric_audit_primary_test.json", test_metrics)
+    write_metric_audit(output_dir / "metric_audit_external.json", external_metrics)
 
     dataset_info = {
         "primary_patients": prepared.primary.patient_count,
@@ -133,9 +152,25 @@ def run(
     try:
         from .plots import write_standard_plots
 
-        write_standard_plots(output_dir, prepared.y_test, test_prob, prepared.y_external, external_prob, prepared.primary.label_names)
+        write_standard_plots(
+            output_dir, prepared.y_test, test_prob, prepared.y_external, external_prob, prepared.primary.label_names,
+            **calibration_kwargs,
+        )
     except Exception as exc:
         (output_dir / "plot_generation_skipped.txt").write_text(str(exc), encoding="utf-8")
+
+    if bool(config.get("reproducibility", {}).get("write_results_manifest", True)):
+        write_results_manifest(
+            output_dir=output_dir,
+            config_path=config_path,
+            config=config,
+            label_names=prepared.primary.label_names,
+            seed=seed,
+            cohort_metadata={
+                "primary_test": {"cohort_id": "IgA_ZCMU_1", "split_id": "held_out_test", "n": int(len(prepared.y_test))},
+                "external_validation": {"cohort_id": "IgA_ZCMU_2", "split_id": "external_validation", "n": int(len(prepared.y_external))},
+            },
+        )
 
     return {
         "output_dir": str(output_dir),
@@ -159,7 +194,8 @@ def train_model(
     criterion: nn.Module = FocalLoss() if loss_name == "focal" else nn.BCEWithLogitsLoss()
 
     x_train, p_train, y_train = _to_tensors(prepared.x_train, prepared.p_train, prepared.y_train, device)
-    x_val, p_val, y_val = _to_tensors(prepared.x_val, prepared.p_val, prepared.y_val, device)
+    x_val, p_val = _to_feature_tensors(prepared.x_val_graph, prepared.p_val, device)
+    y_val = torch.tensor(prepared.y_val, dtype=torch.float32, device=device)
 
     best_state = None
     best_val_loss = float("inf")
@@ -177,7 +213,7 @@ def train_model(
 
         model.eval()
         with torch.no_grad():
-            val_logits = model(x_val, p_val)
+            val_logits = model(x_val, p_val)[prepared.val_query_start :]
             val_loss = criterion(val_logits, y_val).item()
         history_rows.append(f"{epoch},{train_loss.item():.8f},{val_loss:.8f}\n")
 
@@ -223,6 +259,17 @@ def _to_tensors(
     )
 
 
+def _to_feature_tensors(
+    x: np.ndarray,
+    propagation: np.ndarray,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (
+        torch.tensor(x, dtype=torch.float32, device=device),
+        torch.tensor(propagation, dtype=torch.float32, device=device),
+    )
+
+
 def set_seed(seed: int) -> None:
     random.seed(seed)
     np.random.seed(seed)
@@ -233,4 +280,3 @@ def set_seed(seed: int) -> None:
 
 if __name__ == "__main__":
     main()
-

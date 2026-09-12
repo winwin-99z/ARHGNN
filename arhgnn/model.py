@@ -18,7 +18,10 @@ class HypergraphConv(nn.Module):
         use_residual: bool = True,
     ) -> None:
         super().__init__()
-        self.linear = nn.Linear(in_channels, out_channels)
+        # One learnable convolution kernel per semantic hyperedge group,
+        # corresponding to Theta_k in Eq. (5) of the manuscript.
+        self.group_kernels = nn.Parameter(torch.empty(edge_type_count, in_channels, out_channels))
+        nn.init.xavier_uniform_(self.group_kernels)
         self.use_attention = use_attention
         self.use_residual = use_residual
         self.dropout = nn.Dropout(dropout)
@@ -26,7 +29,8 @@ class HypergraphConv(nn.Module):
 
         if use_attention:
             self.type_embeddings = nn.Parameter(torch.empty(edge_type_count, out_channels))
-            self.attention_vector = nn.Parameter(torch.empty(out_channels))
+            # Attention is calculated from [M_k || t_k] as in Eq. (6).
+            self.attention_vector = nn.Parameter(torch.empty(2 * out_channels))
             nn.init.xavier_uniform_(self.type_embeddings)
             nn.init.normal_(self.attention_vector, std=0.02)
         else:
@@ -39,20 +43,25 @@ class HypergraphConv(nn.Module):
             self.residual = None
 
     def forward(self, x: torch.Tensor, propagation: torch.Tensor) -> torch.Tensor:
-        h = self.linear(x)
-        messages = torch.einsum("tnm,mc->tnc", propagation, h)
+        if propagation.ndim != 3 or propagation.shape[0] != self.group_kernels.shape[0]:
+            raise ValueError("propagation must have shape [edge_type, patient, patient].")
+        messages = torch.einsum("tnm,mi,tio->tno", propagation, x, self.group_kernels)
 
         if self.use_attention:
-            typed_messages = torch.tanh(messages + self.type_embeddings[:, None, :])
-            scores = torch.einsum("tnc,c->nt", typed_messages, self.attention_vector)
+            type_embeddings = self.type_embeddings[:, None, :].expand(-1, messages.shape[1], -1)
+            attention_input = torch.cat([messages, type_embeddings], dim=-1)
+            scores = torch.einsum(
+                "tnc,c->nt", F.leaky_relu(attention_input, negative_slope=0.2), self.attention_vector
+            )
             alpha = torch.softmax(scores, dim=1)
             out = torch.einsum("nt,tnc->nc", alpha, messages)
         else:
             out = messages.mean(dim=0)
 
+        out = F.relu(out)
         if self.residual is not None:
             out = out + self.residual(x)
-        return self.dropout(F.relu(self.norm(out)))
+        return self.dropout(self.norm(out))
 
 
 class ARHGNN(nn.Module):
@@ -110,4 +119,3 @@ class FocalLoss(nn.Module):
         bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
         pt = torch.exp(-bce)
         return (self.alpha * (1 - pt).pow(self.gamma) * bce).mean()
-

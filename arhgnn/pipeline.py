@@ -26,15 +26,18 @@ class PreparedData:
     x_train: np.ndarray
     y_train: np.ndarray
     p_train: np.ndarray
-    x_val: np.ndarray
+    x_val_graph: np.ndarray
     y_val: np.ndarray
     p_val: np.ndarray
-    x_test: np.ndarray
+    val_query_start: int
+    x_test_graph: np.ndarray
     y_test: np.ndarray
     p_test: np.ndarray
-    x_external: np.ndarray
+    test_query_start: int
+    x_external_graph: np.ndarray
     y_external: np.ndarray
     p_external: np.ndarray
+    external_query_start: int
     smote_applied: bool
 
 
@@ -74,9 +77,12 @@ def prepare_data(
     builder.fit(x_train, preprocessor.encoded_feature_names, preprocessor.encoded_feature_groups)
 
     train_hg = builder.transform(x_train)
-    val_hg = builder.transform(x_primary[val_idx])
-    test_hg = builder.transform(x_primary[test_idx])
-    external_hg = builder.transform(x_external)
+    x_val_query = x_primary[val_idx]
+    x_test_query = x_primary[test_idx]
+    # Held-out and external patients are attached only to fixed training nodes.
+    val_hg = builder.transform_inductive(x_train, x_val_query)
+    test_hg = builder.transform_inductive(x_train, x_test_query)
+    external_hg = builder.transform_inductive(x_train, x_external)
 
     return PreparedData(
         primary=primary,
@@ -87,15 +93,17 @@ def prepare_data(
         x_train=x_train,
         y_train=y_train,
         p_train=train_hg.propagation,
-        x_val=x_primary[val_idx],
+        x_val_graph=np.vstack([x_train, x_val_query]).astype(np.float32),
         y_val=primary.labels[val_idx],
         p_val=val_hg.propagation,
-        x_test=x_primary[test_idx],
+        val_query_start=int(len(x_train)),
+        x_test_graph=np.vstack([x_train, x_test_query]).astype(np.float32),
         y_test=primary.labels[test_idx],
         p_test=test_hg.propagation,
-        x_external=x_external,
+        test_query_start=int(len(x_train)),
+        x_external_graph=np.vstack([x_train, x_external]).astype(np.float32),
         y_external=external.labels,
         p_external=external_hg.propagation,
+        external_query_start=int(len(x_train)),
         smote_applied=smote_applied,
     )
-

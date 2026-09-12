@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from .metrics import evaluate_multilabel, read_prediction_csv, write_metrics, write_per_label_metrics
+from .metrics import evaluate_multilabel, read_prediction_csv, write_metric_audit, write_metrics, write_per_label_metrics
 
 
 def main() -> None:
@@ -13,19 +13,27 @@ def main() -> None:
     parser.add_argument("--per-label-out", default=None, help="Output per-label metrics CSV path.")
     parser.add_argument("--threshold", type=float, default=0.5)
     parser.add_argument("--bootstrap", type=int, default=1000)
+    parser.add_argument("--common-calibration-bins", type=int, default=10)
+    parser.add_argument("--sparse-calibration-bins", type=int, default=5)
+    parser.add_argument("--sparse-positive-cutoff", type=int, default=20)
     args = parser.parse_args()
 
     pred_path = Path(args.pred)
     y_true, y_prob, label_names = read_prediction_csv(pred_path)
-    metrics = evaluate_multilabel(y_true, y_prob, args.threshold, args.bootstrap, label_names=label_names)
+    metrics = evaluate_multilabel(
+        y_true, y_prob, args.threshold, args.bootstrap, label_names=label_names,
+        common_calibration_bins=args.common_calibration_bins,
+        sparse_calibration_bins=args.sparse_calibration_bins,
+        sparse_positive_cutoff=args.sparse_positive_cutoff,
+    )
     out = Path(args.out) if args.out else pred_path.with_name(pred_path.stem.replace("predictions", "metrics") + ".csv")
     per_label_out = Path(args.per_label_out) if args.per_label_out else pred_path.with_name(pred_path.stem + "_per_label.csv")
     write_metrics(out, metrics)
     write_per_label_metrics(per_label_out, metrics)
+    write_metric_audit(pred_path.with_name(pred_path.stem + "_metric_audit.json"), metrics)
     print(f"Saved metrics to {out}")
     print(f"Saved per-label metrics to {per_label_out}")
 
 
 if __name__ == "__main__":
     main()
-

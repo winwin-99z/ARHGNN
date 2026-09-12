@@ -1,8 +1,8 @@
 seed: 42
 
 paths:
-  primary_data: data/IgAdata1.xlsx
-  external_data: data/IgAdata2.xlsx
+  primary_data: data/private/IgAdata1.xlsx
+  external_data: data/private/IgAdata2.xlsx
   output_dir: results_fixed/ablation
 
 split:
@@ -13,7 +13,7 @@ imbalance:
   use_smote: true
 
 model:
-  hidden_channels: 64
+  hidden_channels: 32
   dropout: 0.5
 
 training:
@@ -25,4 +25,3 @@ training:
 evaluation:
   threshold: 0.5
   bootstrap: 300
-

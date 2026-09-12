@@ -296,6 +296,79 @@ class PatientHypergraphBuilder:
             edge_metadata=metadata,
         )
 
+    def transform_inductive(self, reference_features: np.ndarray, query_features: np.ndarray) -> HypergraphData:
+        """Connect query patients only to training-reference patients.
+
+        Hyperedge membership and weights are fixed from the reference patients.
+        Query--query links are never created, so a held-out or external cohort
+        cannot alter training-node degrees, normalisation, or edge weights.
+        """
+
+        if not self.fitted:
+            raise RuntimeError("PatientHypergraphBuilder must be fitted before transform_inductive().")
+        reference = _ensure_2d_float(reference_features)
+        query = _ensure_2d_float(query_features)
+        if reference.shape[1] != len(self.feature_specs) or query.shape[1] != len(self.feature_specs):
+            raise ValueError("Feature width differs from the fitted hypergraph builder.")
+
+        n_reference, n_query = len(reference), len(query)
+        total = n_reference + n_query
+        type_count = len(EDGE_TYPE_NAMES)
+        accum = np.zeros((type_count, total, total), dtype=np.float32)
+        degrees = np.zeros((type_count, total), dtype=np.float32)
+        metadata: list[dict[str, object]] = []
+
+        for spec, name, group in zip(self.feature_specs, self.feature_names, self.feature_groups):
+            column = int(spec["column"])
+            type_id = EDGE_TYPE_NAMES.index(group) if group in EDGE_TYPE_NAMES else EDGE_TYPE_NAMES.index("other")
+            reference_groups = _groups_for_spec(reference[:, column], spec)
+            query_groups = _groups_for_spec(query[:, column], spec)
+            for group_id, reference_nodes in reference_groups.items():
+                reference_nodes = np.asarray(reference_nodes, dtype=np.int64)
+                if len(reference_nodes) < self.min_edge_size:
+                    continue
+                query_nodes = np.asarray(query_groups.get(group_id, []), dtype=np.int64) + n_reference
+                weight = 1.0 / float(len(reference_nodes))
+                accum[type_id][np.ix_(reference_nodes, reference_nodes)] += weight
+                degrees[type_id, reference_nodes] += 1.0
+                if len(query_nodes):
+                    accum[type_id][np.ix_(reference_nodes, query_nodes)] += weight
+                    accum[type_id][np.ix_(query_nodes, reference_nodes)] += weight
+                    degrees[type_id, query_nodes] += 1.0
+                metadata.append(
+                    {
+                        "name": f"{name}={group_id}",
+                        "type": EDGE_TYPE_NAMES[type_id],
+                        "reference_size": int(len(reference_nodes)),
+                        "query_size": int(len(query_nodes)),
+                    }
+                )
+
+        total_degrees = degrees.sum(axis=0)
+        # Only reference nodes receive a fallback self-loop. A query self-loop
+        # would constitute a query--query edge and would violate inductive use.
+        isolated = np.where(total_degrees == 0)[0]
+        isolated = isolated[isolated < n_reference]
+        if len(isolated):
+            other = EDGE_TYPE_NAMES.index("other")
+            accum[other, isolated, isolated] = 1.0
+            degrees[other, isolated] = 1.0
+            for node in isolated:
+                metadata.append({"name": f"self_loop_{node}", "type": "other", "reference_size": 1, "query_size": 0})
+
+        for type_id in range(type_count):
+            degree = degrees[type_id]
+            scale = np.zeros_like(degree, dtype=np.float32)
+            nonzero = degree > 0
+            scale[nonzero] = 1.0 / np.sqrt(degree[nonzero])
+            accum[type_id] = accum[type_id] * scale[:, None] * scale[None, :]
+
+        return HypergraphData(
+            propagation=accum.astype(np.float32),
+            edge_count=len(metadata),
+            edge_metadata=metadata,
+        )
+
 
 def validate_no_label_leakage(feature_names: Iterable[str], label_names: Iterable[str]) -> None:
     overlap = sorted(set(feature_names).intersection(set(label_names)))
@@ -319,3 +392,10 @@ def _ensure_2d_float(values: np.ndarray) -> np.ndarray:
         raise ValueError("Expected a 2D feature matrix.")
     return arr
 
+
+def _groups_for_spec(values: np.ndarray, spec: dict[str, object]) -> dict[str, np.ndarray]:
+    values = np.asarray(values, dtype=np.float32)
+    if spec["kind"] == "binary":
+        return {"active": np.where(values > 0.5)[0]}
+    bins = np.digitize(values, np.asarray(spec["edges"], dtype=np.float32), right=False)
+    return {f"bin_{bin_id}": np.where(bins == bin_id)[0] for bin_id in np.unique(bins)}
